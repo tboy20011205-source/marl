@@ -10,9 +10,10 @@ We use low-level policies for either fight or escape maneuvers. These will be fi
 
 <img src="img/policies.png" width="300">
 
-## Requiered Packages 
+## Required Packages
 
-- ray["rllib"] == 2.4.0
+Install via `pip install -r requirements.txt`:
+
 - torch >= 2.0.0
 - numpy == 1.24.3
 - gymnasium == 0.26.3
@@ -21,6 +22,8 @@ We use low-level policies for either fight or escape maneuvers. These will be fi
 - cartopy >= 0.21.0
 - geographiclib == 2.0
 - tqdm
+
+> **Note:** This project no longer depends on Ray RLlib. PPO is implemented from scratch in `algorithms/ppo.py` with full visibility into the algorithm logic (PPO-Clip, GAE, centralized critic).
 
 ## Training
 

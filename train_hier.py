@@ -1,5 +1,6 @@
 """
 Main file for training the high-level commander policy.
+Uses custom PPO implementation instead of Ray RLlib.
 """
 
 import os
@@ -9,47 +10,37 @@ import tqdm
 import torch
 import logging
 import numpy as np
-from gymnasium import spaces
-from tensorboard import program
 from pathlib import Path
-from ray.rllib.algorithms.ppo import PPOConfig
-from ray.rllib.models import ModelCatalog
-from ray.rllib.policy.policy import PolicySpec
-from ray.rllib.policy.sample_batch import SampleBatch
-from ray.rllib.algorithms.callbacks import DefaultCallbacks
-from models.ac_models_hier import CommanderGru
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    HAS_TB = True
+except ImportError:
+    HAS_TB = False
+
+from algorithms.ppo import MultiAgentPPO, PPOPolicy, SlimFC
+from models.torch_models_hier import CommanderGru
 from config import Config
 from envs.env_hier import HighLevelEnv
 
-N_OPP_HL = 2 #change for sensing
-ACT_DIM = N_OPP_HL+1
-OBS_DIM = 14+10*N_OPP_HL
+N_OPP_HL = 2  # change for sensing
+ACT_DIM = N_OPP_HL + 1
+OBS_DIM = 14 + 10 * N_OPP_HL
 
-def update_logs(args, log_dir):
-    """
-    Copy stored checkpoints from Ray log to experiment log directory.
-    """
 
-    dirs = sorted(Path(log_dir).glob('*/'), key=os.path.getmtime)
-    check = ''
-    event = ''
-    for item in dirs:
-        if "checkpoint" in item.name:
-            check = str(item)
-        if "events" in item.name:
-            event = str(item)
-    
+def update_logs(args):
+    """Save checkpoints to experiment log directory."""
     result_dir = os.path.join(args.log_path, 'checkpoint')
-    
     try:
         shutil.rmtree(result_dir)
-    except:
+    except Exception:
         pass
+    check_dir = os.path.join(args.log_path, 'checkpoint')
+    if os.path.exists(check_dir):
+        shutil.copytree(check_dir, result_dir, symlinks=False, dirs_exist_ok=False)
 
-    shutil.copytree(check,result_dir,symlinks=False,dirs_exist_ok=False)
-    shutil.copy(event,result_dir)
 
 def evaluate(args, algo, env, epoch):
+    """Evaluate commander policy and save combat scenario pictures."""
 
     def cc_obs(obs):
         return {
@@ -60,155 +51,161 @@ def evaluate(args, algo, env, epoch):
             "act_2": np.zeros(1),
             "act_3": np.zeros(1),
         }
-    
+
     state, _ = env.reset()
     reward = 0
     done = False
     step = 0
+    states = [torch.zeros(200), torch.zeros(200)]
+
     while not done:
         actions = {}
-        states = [torch.zeros(200), torch.zeros(200)]
-
         for ag_id, ag_s in state.items():
-            a = algo.compute_single_action(observation=cc_obs(ag_s), state=states, policy_id="commander_policy", explore=False)
+            a = algo.compute_single_action(
+                observation=cc_obs(ag_s),
+                state=states,
+                policy_id="commander_policy",
+                explore=False)
             actions[ag_id] = a[0]
-            states[0] = a[1][0]
-            states[1] = a[1][1]
+            if a[1] and len(a[1]) >= 2:
+                states[0] = a[1][0]
+                states[1] = a[1][1]
 
         state, rew, hist, trunc, _ = env.step(actions)
-
         done = hist["__all__"] or trunc["__all__"]
         for r in rew.values():
             reward += r
-
         step += 1
+
         if args.render:
             env.plot(Path(args.log_path, "current.png"))
             time.sleep(0.18)
 
     reward = round(reward, 3)
-    env.plot(Path(args.log_path, f"Ep_{epoch}_It_{step}_Rew_{reward}.png"))
+    env.plot(Path(args.log_path,
+                  f"Ep_{epoch}_It_{step}_Rew_{reward}.png"))
 
-def make_checkpoint(args, algo, log_dir, epoch, env=None):
-    algo.save()
-    update_logs(args, log_dir)
-    if args.eval and epoch%500==0:
+
+def make_checkpoint(args, algo, epoch, env=None):
+    algo.save(os.path.join(args.log_path, 'checkpoint'))
+    update_logs(args)
+    if args.eval and epoch % 500 == 0:
         for _ in range(2):
             evaluate(args, algo, env, epoch)
 
+
 def get_policy(args):
-    class CustomCallback(DefaultCallbacks):
-        """
-        Here, the opponent's actions will be added to the episode states 
-        And the current level will be tracked. 
-        """
-        def on_postprocess_trajectory(
-            self,
-            worker,
-            episode,
-            agent_id,
-            policy_id,
-            policies,
-            postprocessed_batch,
-            original_batches,
-            **kwargs
-        ):
-            acts = []
+    """
+    Create MultiAgentPPO with the Commander policy.
+    Uses centralized critic: each agent sees all agents' observations.
+    """
 
-            to_update = postprocessed_batch[SampleBatch.CUR_OBS]
-            _, own_batch = original_batches[agent_id]
-            own_act = np.squeeze(own_batch[SampleBatch.ACTIONS])
-            acts.append(own_act)
-
-            oth_agents = list(range(1,4))
-            oth_agents.remove(agent_id)
-
-            for i in oth_agents:
-                _, oth_batch = original_batches[i]
-                oth_act = np.squeeze(oth_batch[SampleBatch.ACTIONS])
-                acts.append(oth_act)
-            
-            for i, act in enumerate(acts):
-                to_update[:,i] = act/N_OPP_HL
-
-    def central_critic_observer(agent_obs, **kw):
-        """
-        Determines which agents will get an observation. 
-        In 'on_postprocess_trajectory', the keys will be called lexicographically. 
-        """
-        new_obs = {
+    def central_critic_observer(agent_obs):
+        """Augment observations for centralized critic (3 agents)."""
+        return {
             1: {
-                "obs_1_own": agent_obs[1] ,
+                "obs_1_own": agent_obs[1],
                 "obs_2": agent_obs[2],
                 "obs_3": agent_obs[3],
-                "act_1_own": np.zeros(1),
-                "act_2": np.zeros(1),
-                "act_3": np.zeros(1),
+                "act_1_own": np.zeros(1, dtype=np.float32),
+                "act_2": np.zeros(1, dtype=np.float32),
+                "act_3": np.zeros(1, dtype=np.float32),
             },
             2: {
-                "obs_1_own": agent_obs[2] ,
+                "obs_1_own": agent_obs[2],
                 "obs_2": agent_obs[1],
                 "obs_3": agent_obs[3],
-                "act_1_own": np.zeros(1),
-                "act_2": np.zeros(1),
-                "act_3": np.zeros(1),
+                "act_1_own": np.zeros(1, dtype=np.float32),
+                "act_2": np.zeros(1, dtype=np.float32),
+                "act_3": np.zeros(1, dtype=np.float32),
             },
             3: {
-                "obs_1_own": agent_obs[3] ,
+                "obs_1_own": agent_obs[3],
                 "obs_2": agent_obs[1],
                 "obs_3": agent_obs[2],
-                "act_1_own": np.zeros(1),
-                "act_2": np.zeros(1),
-                "act_3": np.zeros(1),
+                "act_1_own": np.zeros(1, dtype=np.float32),
+                "act_2": np.zeros(1, dtype=np.float32),
+                "act_3": np.zeros(1, dtype=np.float32),
             },
         }
-        return new_obs
 
-    ModelCatalog.register_custom_model("commander_model",CommanderGru)
-    action_space = spaces.Discrete(ACT_DIM)
-    observer_space = spaces.Dict(
-        {
-            "obs_1_own": spaces.Box(low=0, high=1, shape=(OBS_DIM,)),
-            "obs_2": spaces.Box(low=0, high=1, shape=(OBS_DIM,)),
-            "obs_3": spaces.Box(low=0, high=1, shape=(OBS_DIM,)),
-            "act_1_own": spaces.Box(low=0, high=ACT_DIM-1, shape=(1,), dtype=np.float32),
-            "act_2": spaces.Box(low=0, high=ACT_DIM-1, shape=(1,), dtype=np.float32),
-            "act_3": spaces.Box(low=0, high=ACT_DIM-1, shape=(1,), dtype=np.float32),
-        }
+    def postprocess_trajectory(episode_data):
+        """
+        Fill in actual actions (normalized by /N_OPP_HL) into augmented obs.
+        Equivalent to RLlib CustomCallback.on_postprocess_trajectory.
+        Each step has num_agents transitions in agent id order (1, 2, 3).
+        """
+        for pid, traj in episode_data.items():
+            if len(traj) == 0:
+                continue
+            n_agents = args.num_agents
+            num_steps = len(traj) // n_agents
+
+            for s in range(num_steps):
+                base = s * n_agents
+                step_acts = []
+                for a in range(n_agents):
+                    act = traj[base + a]["action"].cpu().numpy()
+                    step_acts.append(float(act) / N_OPP_HL)
+
+                # Agent 1: own=acts[0], other2=acts[1], other3=acts[2]
+                traj[base + 0]["aug_obs"]["act_1_own"] = np.atleast_1d(step_acts[0]).astype(np.float32)
+                traj[base + 0]["aug_obs"]["act_2"] = np.atleast_1d(step_acts[1]).astype(np.float32)
+                traj[base + 0]["aug_obs"]["act_3"] = np.atleast_1d(step_acts[2]).astype(np.float32)
+
+                # Agent 2: own=acts[1], other2=acts[0], other3=acts[2]
+                traj[base + 1]["aug_obs"]["act_1_own"] = np.atleast_1d(step_acts[1]).astype(np.float32)
+                traj[base + 1]["aug_obs"]["act_2"] = np.atleast_1d(step_acts[0]).astype(np.float32)
+                traj[base + 1]["aug_obs"]["act_3"] = np.atleast_1d(step_acts[2]).astype(np.float32)
+
+                # Agent 3: own=acts[2], other2=acts[0], other3=acts[1]
+                traj[base + 2]["aug_obs"]["act_1_own"] = np.atleast_1d(step_acts[2]).astype(np.float32)
+                traj[base + 2]["aug_obs"]["act_2"] = np.atleast_1d(step_acts[0]).astype(np.float32)
+                traj[base + 2]["aug_obs"]["act_3"] = np.atleast_1d(step_acts[1]).astype(np.float32)
+
+    # Create shared layer
+    shared_layer = SlimFC(500, 500, activation_fn=torch.nn.Tanh,
+                          initializer=torch.nn.init.orthogonal_)
+
+    # Create Commander model
+    model = CommanderGru()
+    model.shared_layer = shared_layer
+
+    # Create policy (shared across all agents via policy_mapping_fn pattern)
+    policy = PPOPolicy(
+        model=model,
+        action_dims=[ACT_DIM],  # Discrete action space
+        lr=1e-4,
+        clip_param=0.25,
+        entropy_coeff=0.01,
+        vf_coeff=0.5,
+        max_grad_norm=0.5,
     )
 
-    algo = (
-        PPOConfig()
-        .rollouts(num_rollout_workers=args.num_workers, batch_mode="complete_episodes", enable_connectors=False)
-        .resources(num_gpus=args.gpu)
-        .evaluation(evaluation_interval=None)
-        .environment(env=HighLevelEnv, env_config=args.env_config)
-        .training(train_batch_size=args.batch_size, kl_target=0.05, gamma=0.99, clip_param=0.25,lr=1e-4, sgd_minibatch_size=args.mini_batch_size)
-        .framework("torch")
+    policies = {"commander_policy": policy}
 
-        # even though only 'one commander agent' is acting, we use multi-agent to have centalized critic option -> CTDE
-        .multi_agent(policies={
-                "commander_policy": PolicySpec(
-                    None,
-                    observer_space,
-                    action_space,
-                    config={
-                        "model": {
-                            "custom_model": "commander_model"
-                        }
-                    }
-                )
-            },
-            policy_mapping_fn= lambda agent_id, episode, worker, **kwargs: "commander_policy",
-            observation_fn=central_critic_observer)
-        .callbacks(CustomCallback)
-        .build()
+    def env_fn():
+        return HighLevelEnv(args.env_config)
+
+    algo = MultiAgentPPO(
+        policies=policies,
+        env_fn=env_fn,
+        train_batch_size=args.batch_size,
+        mini_batch_size=args.mini_batch_size,
+        gamma=0.99,
+        lambda_=0.95,
+        num_sgd_iter=10,
+        observation_fn=central_critic_observer,
+        postprocess_fn=postprocess_trajectory,
     )
+
     return algo
+
 
 if __name__ == '__main__':
     rllib_logger = logging.getLogger("ray.rllib")
     rllib_logger.setLevel(logging.ERROR)
+
     args = Config(1).get_arguments
     test_env = None
     algo = get_policy(args)
@@ -221,31 +218,38 @@ if __name__ == '__main__':
     if args.eval:
         test_env = HighLevelEnv(args.env_config)
 
-    log_dir = os.path.normpath(algo.logdir)
-    tb = program.TensorBoard()
-    port = 6006
-    started = False
-    while not started:
-        try:
-            tb.configure(argv=[None, '--logdir', log_dir, '--bind_all', f'--port={port}'])
-            url = tb.launch()
-            started = True
-        except:
-            port += 1
+    # Set up logging directory
+    log_dir = os.path.join(args.log_path, 'tb_logs')
+    os.makedirs(log_dir, exist_ok=True)
+    algo.logdir = log_dir
+    writer = SummaryWriter(log_dir=log_dir) if HAS_TB else None
 
     print("\n", "--- NO ERRORS FOUND, STARTING TRAINING ---")
+    if HAS_TB:
+        print(f"TensorBoard: run 'tensorboard --logdir {log_dir}' to view")
 
     time.sleep(2)
     time_acc = 0
-    iters = tqdm.trange(0, args.epochs+1,  leave=True)
+    iters = tqdm.trange(0, args.epochs + 1, leave=True)
     os.system('clear') if os.name == 'posix' else os.system('cls')
 
     for i in iters:
         t = time.time()
         result = algo.train()
-        time_acc += time.time()-t
-        iters.set_description(f"{i}) Reward = {result['episode_reward_mean']:.2f} | Avg. Episode Time = {round(time_acc/(i+1), 3)} | TB: {url} | Progress")
-        
-        if i % 50 == 0:
-            make_checkpoint(args, algo, log_dir, i, test_env)
+        time_acc += time.time() - t
 
+        if writer is not None:
+            for k, v in result.items():
+                if isinstance(v, (int, float)):
+                    writer.add_scalar(k, v, i)
+
+        iters.set_description(
+            f"{i}) Reward = {result.get('episode_reward_mean', 0):.2f} | "
+            f"Avg. Episode Time = {round(time_acc / (i + 1), 3)} | Progress"
+        )
+
+        if i % 50 == 0:
+            make_checkpoint(args, algo, i, test_env)
+
+    if writer is not None:
+        writer.close()

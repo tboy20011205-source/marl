@@ -4,7 +4,7 @@ import os
 import random
 import numpy as np
 from pathlib import Path
-from ray.rllib.env.multi_agent_env import MultiAgentEnv
+from gymnasium import Env
 from math import sin, cos, acos, pi, hypot, radians, exp, sqrt
 from warsim.scenplotter.scenario_plotter import PlotConfig, ColorRGBA, StatusMessage, TopLeftMessage, \
     Airplane, PolyLine, Drawable, Waypoint, Missile, ScenarioPlotter
@@ -31,7 +31,7 @@ OBS_AC2 = 24
 OBS_ESC_AC1 = 30
 OBS_ESC_AC2 = 29
 
-class HHMARLBaseEnv(MultiAgentEnv):
+class HHMARLBaseEnv(Env):
     """
     Base class for HHMARL 2D with core functionalities. 
     """

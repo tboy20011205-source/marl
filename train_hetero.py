@@ -1,6 +1,8 @@
 """
 Main file for training low-level heterogeneous agents.
-HETEROGENEOUS: Agend IDs to AC types: 1->1, 2->2, 3->1, 4->2
+Uses custom PPO implementation instead of Ray RLlib.
+
+HETEROGENEOUS: Agent IDs to AC types: 1->1, 2->2, 3->1, 4->2
 """
 
 import os
@@ -9,15 +11,15 @@ import shutil
 import tqdm
 import torch
 import numpy as np
-from gymnasium import spaces
-from tensorboard import program
 from pathlib import Path
-from ray.rllib.algorithms.ppo import PPOConfig
-from ray.rllib.models import ModelCatalog
-from ray.rllib.policy.policy import PolicySpec
-from ray.rllib.policy.sample_batch import SampleBatch
-from ray.rllib.algorithms.callbacks import DefaultCallbacks
-from models.ac_models_hetero import Esc1, Esc2, Fight1, Fight2
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    HAS_TB = True
+except ImportError:
+    HAS_TB = False
+
+from algorithms.ppo import MultiAgentPPO, PPOPolicy, SlimFC
+from models.torch_models_hetero import Fight1, Fight2, Esc1, Esc2
 from config import Config
 from envs.env_hetero import LowLevelEnv
 
@@ -29,49 +31,43 @@ OBS_ESC_AC1 = 30
 OBS_ESC_AC2 = 29
 POLICY_DIR = 'policies'
 
-def update_logs(args, log_dir, level, epoch):
-    """
-    Copy stored checkpoints from Ray log to experiment log directory.
-    """
-    dirs = sorted(Path(log_dir).glob('*/'), key=os.path.getmtime)
-    check = ''
-    event = ''
-    for item in dirs:
-        if "checkpoint" in item.name:
-            check = str(item)
-        if "events" in item.name:
-            event = str(item)
-    
+
+def create_shared_layer():
+    """Create the shared layer used by all models."""
+    return SlimFC(500, 500, activation_fn=torch.nn.Tanh,
+                  initializer=torch.nn.init.orthogonal_)
+
+
+def update_logs(args, results_dir, level, epoch):
+    """Save checkpoints to experiment log directory."""
     result_dir = os.path.join(args.log_path, 'checkpoint')
-    
     try:
         shutil.rmtree(result_dir)
-    except:
+    except Exception:
         pass
+    if os.path.exists(results_dir):
+        shutil.copytree(results_dir, result_dir, symlinks=False, dirs_exist_ok=False)
 
-    shutil.copytree(check,result_dir,symlinks=False,dirs_exist_ok=False)
-    shutil.copy(event,result_dir)
 
 def evaluate(args, algo, env, epoch, level, it):
-    """
-    Evaluations are stored as pictures of combat scenarios, with rewards in filename.
-    """
-    def cc_obs(obs, id):
-        if id == 1:
+    """Evaluations are stored as pictures of combat scenarios."""
+
+    def cc_obs(obs, agent_id):
+        if agent_id == 1:
             return {
-                "obs_1_own": obs[1] ,
+                "obs_1_own": obs[1],
                 "obs_2": obs[2],
                 "act_1_own": np.zeros(ACTION_DIM_AC1),
                 "act_2": np.zeros(ACTION_DIM_AC2),
             }
-        elif id == 2:
+        elif agent_id == 2:
             return {
-                "obs_1_own": obs[2] ,
+                "obs_1_own": obs[2],
                 "obs_2": obs[1],
                 "act_1_own": np.zeros(ACTION_DIM_AC2),
                 "act_2": np.zeros(ACTION_DIM_AC1),
             }
-    
+
     state, _ = env.reset()
     reward = 0
     done = False
@@ -79,7 +75,11 @@ def evaluate(args, algo, env, epoch, level, it):
     while not done:
         actions = {}
         for ag_id in state.keys():
-            a = algo.compute_single_action(observation=cc_obs(state, ag_id), state=torch.zeros(1), policy_id=f"ac{ag_id}_policy", explore=False)
+            a = algo.compute_single_action(
+                observation=cc_obs(state, ag_id),
+                state=torch.zeros(1),
+                policy_id=f"ac{ag_id}_policy",
+                explore=False)
             actions[ag_id] = a[0]
 
         state, rew, term, trunc, _ = env.step(actions)
@@ -93,86 +93,44 @@ def evaluate(args, algo, env, epoch, level, it):
             time.sleep(0.18)
 
     reward = round(reward, 3)
-    env.plot(Path(args.log_path, f"Ep_{epoch}_It_{step}_Lv{level}_Rew_{reward}.png"))
+    env.plot(Path(args.log_path,
+                  f"Ep_{epoch}_It_{step}_Lv{level}_Rew_{reward}.png"))
+
 
 def make_checkpoint(args, algo, log_dir, epoch, level, env=None):
-    algo.save()
-    update_logs(args, log_dir, level, epoch)
+    algo.save(os.path.join(args.log_path, 'checkpoint'))
+    update_logs(args, os.path.join(args.log_path, 'checkpoint'), level, epoch)
     for it in range(2):
         if args.level >= 3:
-            algo.export_policy_model(os.path.join(os.path.dirname(__file__), POLICY_DIR), f'ac{it+1}_policy')
-            policy_name = f'L{args.level}_AC{it+1}_{args.agent_mode}'
-            os.rename(f'{POLICY_DIR}/model.pt', f'{POLICY_DIR}/{policy_name}.pt')
-        if args.eval and epoch%500==0:
+            algo.export_policy_model(os.path.join(os.path.dirname(__file__), POLICY_DIR),
+                                     f'ac{it + 1}_policy')
+            policy_name = f'L{args.level}_AC{it + 1}_{args.agent_mode}'
+            old_path = os.path.join(POLICY_DIR, 'model.pt')
+            new_path = os.path.join(POLICY_DIR, f'{policy_name}.pt')
+            if os.path.exists(old_path):
+                os.rename(old_path, new_path)
+        if args.eval and epoch % 500 == 0:
             evaluate(args, algo, env, epoch, level, it)
+
 
 def get_policy(args):
     """
-    Agents get assigned the neural networks Fight1, Fight2 and Esc1, Esc2.
+    Create MultiAgentPPO with heterogeneous policies.
+    Agents get assigned Fight1/Fight2 or Esc1/Esc2 networks.
     """
-    class CustomCallback(DefaultCallbacks):
-        """
-        This callback is used to have fully observable critic. Other agent's
-        observations and actions will be added to this episode batch.
 
-        ATTENTION: This callback is set up for 2vs2 training.  
-        """
-        def on_postprocess_trajectory(
-            self,
-            worker,
-            episode,
-            agent_id,
-            policy_id,
-            policies,
-            postprocessed_batch,
-            original_batches,
-            **kwargs
-        ):
-            to_update = postprocessed_batch[SampleBatch.CUR_OBS]
-            other_id = 2 if agent_id == 1 else 1
-            _, own_batch = original_batches[agent_id]
-            own_act = np.squeeze(own_batch[SampleBatch.ACTIONS])
-            _, fri_batch = original_batches[other_id]
-            fri_act = np.squeeze(fri_batch[SampleBatch.ACTIONS])
-            
-            acts = [own_act, fri_act]
-
-            for i, act in enumerate(acts):
-                if agent_id == 1 and i == 0 or agent_id==2 and i==1:
-                    if agent_id == 1:
-                        to_update[:,i*4] = act[:,0]/12.0
-                        to_update[:,i*4+1] = act[:,1]/8.0
-                        to_update[:,i*4+2] = act[:,2]
-                        to_update[:,i*4+3] = act[:,3]
-                    else:
-                        to_update[:,i*3] = act[:,0]/12.0
-                        to_update[:,i*3+1] = act[:,1]/8.0
-                        to_update[:,i*3+2] = act[:,2]
-                        to_update[:,i*3+3] = act[:,3]
-                elif agent_id == 1 and i == 1 or agent_id==2 and i==0:
-                    if agent_id==1:
-                        to_update[:,i*4] = act[:,0]/12.0
-                        to_update[:,i*4+1] = act[:,1]/8.0
-                        to_update[:,i*4+2] = act[:,2]
-                    else:
-                        to_update[:,i] = act[:,0]/12.0
-                        to_update[:,i+1] = act[:,1]/8.0
-                        to_update[:,i+2] = act[:,2]
-
-    def central_critic_observer(agent_obs, **kw):
-        """
-        Determines which agents will get an observation. 
-        In 'on_postprocess_trajectory', the keys will be called lexicographically. 
-        """
+    # Centralized critic observation function
+    def central_critic_observer(agent_obs):
+        """Augment observations for centralized critic."""
         new_obs = {
             1: {
-                "obs_1_own": agent_obs[1] ,
+                "obs_1_own": agent_obs[1],
                 "obs_2": agent_obs[2],
                 "act_1_own": np.zeros(ACTION_DIM_AC1),
                 "act_2": np.zeros(ACTION_DIM_AC2),
             },
             2: {
-                "obs_1_own": agent_obs[2] ,
+                "obs_1_own": agent_obs[2],
                 "obs_2": agent_obs[1],
                 "act_1_own": np.zeros(ACTION_DIM_AC2),
                 "act_2": np.zeros(ACTION_DIM_AC1),
@@ -180,70 +138,108 @@ def get_policy(args):
         }
         return new_obs
 
-    observer_space_ac1 = spaces.Dict(
-        {
-            "obs_1_own": spaces.Box(low=0, high=1, shape=(OBS_AC1 if args.agent_mode=="fight" else OBS_ESC_AC1,)),
-            "obs_2": spaces.Box(low=0, high=1, shape=(OBS_AC2 if args.agent_mode=="fight" else OBS_ESC_AC2,)),
-            "act_1_own": spaces.Box(low=0, high=12, shape=(ACTION_DIM_AC1,), dtype=np.float32),
-            "act_2": spaces.Box(low=0, high=12, shape=(ACTION_DIM_AC2,), dtype=np.float32),
-        }
-    )
-    observer_space_ac2 = spaces.Dict(
-        {
-            "obs_1_own": spaces.Box(low=0, high=1, shape=(OBS_AC2 if args.agent_mode=="fight" else OBS_ESC_AC2,)),
-            "obs_2": spaces.Box(low=0, high=1, shape=(OBS_AC1 if args.agent_mode=="fight" else OBS_ESC_AC1,)),
-            "act_1_own": spaces.Box(low=0, high=12, shape=(ACTION_DIM_AC2,), dtype=np.float32),
-            "act_2": spaces.Box(low=0, high=12, shape=(ACTION_DIM_AC1,), dtype=np.float32),
-        }
-    )
+    def postprocess_trajectory(episode_data):
+        """
+        Replace zero actions in augmented observations with actual actions.
+        Normalizes heading (/12) and speed (/8) to [0,1] range, matching
+        the original RLlib CustomCallback.on_postprocess_trajectory.
+        """
+        policy_actions = {}
+        for pid, traj in episode_data.items():
+            actions_list = [t["action"].cpu().numpy() for t in traj]
+            policy_actions[pid] = np.stack(actions_list, axis=0)
 
+        agent_acts = {}
+        if "ac1_policy" in policy_actions:
+            agent_acts[1] = policy_actions["ac1_policy"]
+        if "ac2_policy" in policy_actions:
+            agent_acts[2] = policy_actions["ac2_policy"]
+
+        def norm_own(act):
+            a = act.astype(np.float32).copy()
+            a[0] /= 12.0
+            a[1] /= 8.0
+            return a
+
+        for pid, traj in episode_data.items():
+            agent_id = 1 if pid == "ac1_policy" else 2
+            other_id = 2 if agent_id == 1 else 1
+
+            for t_idx, transition in enumerate(traj):
+                obs = transition["aug_obs"]
+
+                # Own actions: fill all dims with normalized values
+                own = norm_own(agent_acts[agent_id][t_idx])
+                obs["act_1_own"] = own
+
+                # Other agent's actions: overwrite first 3 elements of existing array
+                # (preserves original array shape — matches RLlib callback behavior)
+                if other_id in agent_acts and t_idx < len(agent_acts[other_id]):
+                    other = agent_acts[other_id][t_idx].astype(np.float32).copy()
+                    other[0] /= 12.0
+                    other[1] /= 8.0
+                    n = min(len(other), 3)
+                    obs["act_2"][:n] = other[:n]
+
+    # Create shared layer
+    shared_layer = create_shared_layer()
+
+    # Create models based on agent_mode
     if args.agent_mode == "escape":
-        ModelCatalog.register_custom_model("ac1_model_esc",Esc1)
-        ModelCatalog.register_custom_model("ac2_model_esc",Esc2)
+        model1 = Esc1()
+        model2 = Esc2()
+        action_dims1 = [13, 9, 2, 2]
+        action_dims2 = [13, 9, 2]
     else:
-        ModelCatalog.register_custom_model('ac1_model', Fight1) 
-        ModelCatalog.register_custom_model('ac2_model', Fight2)
+        model1 = Fight1()
+        model2 = Fight2()
+        action_dims1 = [13, 9, 2, 2]
+        action_dims2 = [13, 9, 2]
 
-    action_space_ac1 = spaces.MultiDiscrete([13,9,2,2])
-    action_space_ac2 = spaces.MultiDiscrete([13,9,2])
+    # Share the shared layer across models (same as original RLlib behavior)
+    model1.shared_layer = shared_layer
+    model2.shared_layer = shared_layer
 
-    algo = (
-        PPOConfig()
-        .rollouts(num_rollout_workers=args.num_workers, batch_mode="complete_episodes", enable_connectors=False) #compare with cetralized_critic_2.py
-        .resources(num_gpus=args.gpu)
-        .evaluation(evaluation_interval=None)
-        .environment(env=LowLevelEnv, env_config=args.env_config)
-        .training(kl_target=0.025, train_batch_size=args.batch_size, gamma=0.99, clip_param=0.25,lr=1e-4, lambda_=0.95, sgd_minibatch_size=args.mini_batch_size)
-        .framework("torch")
-        .multi_agent(policies={
-                "ac1_policy": PolicySpec(
-                    None,
-                    observer_space_ac1,
-                    action_space_ac1,
-                    config={
-                        "model": {
-                            "custom_model": "ac1_model_esc" if args.agent_mode=="escape" else 'ac1_model'
-                        }
-                    }
-                ),
-                "ac2_policy": PolicySpec(
-                    None,
-                    observer_space_ac2,
-                    action_space_ac2,
-                    config={
-                        "model": {
-                            "custom_model": "ac2_model_esc" if args.agent_mode=="escape" else 'ac2_model'
-                        }
-                    }
-                )
-            },
-            policy_mapping_fn=lambda agent_id, episode, worker, **kwargs: f'ac{agent_id}_policy',
-            policies_to_train=["ac1_policy", "ac2_policy"],
-            observation_fn=central_critic_observer)
-        .callbacks(CustomCallback)
-        .build()
+    # Create policies
+    policies = {
+        "ac1_policy": PPOPolicy(
+            model=model1,
+            action_dims=action_dims1,
+            lr=1e-4,
+            clip_param=0.25,
+            entropy_coeff=0.01,
+            vf_coeff=0.5,
+            max_grad_norm=0.5,
+        ),
+        "ac2_policy": PPOPolicy(
+            model=model2,
+            action_dims=action_dims2,
+            lr=1e-4,
+            clip_param=0.25,
+            entropy_coeff=0.01,
+            vf_coeff=0.5,
+            max_grad_norm=0.5,
+        ),
+    }
+
+    # Create env factory
+    def env_fn():
+        return LowLevelEnv(args.env_config)
+
+    algo = MultiAgentPPO(
+        policies=policies,
+        env_fn=env_fn,
+        train_batch_size=args.batch_size,
+        mini_batch_size=args.mini_batch_size,
+        gamma=0.99,
+        lambda_=0.95,
+        num_sgd_iter=10,
+        observation_fn=central_critic_observer,
+        postprocess_fn=postprocess_trajectory,
     )
+
     return algo
+
 
 if __name__ == '__main__':
     args = Config(0).get_arguments
@@ -258,31 +254,39 @@ if __name__ == '__main__':
     if args.eval:
         test_env = LowLevelEnv(args.env_config)
 
-    log_dir = os.path.normpath(algo.logdir)
-    tb = program.TensorBoard()
-    port = 6006
-    started = False
-    url = None
-    while not started:
-        try:
-            tb.configure(argv=[None, '--logdir', log_dir, '--bind_all', f'--port={port}'])
-            url = tb.launch()
-            started = True
-        except:
-            port += 1
+    # Set up logging directory
+    log_dir = os.path.join(args.log_path, 'tb_logs')
+    os.makedirs(log_dir, exist_ok=True)
+    algo.logdir = log_dir
+    writer = SummaryWriter(log_dir=log_dir) if HAS_TB else None
 
     print("\n", "--- NO ERRORS FOUND, STARTING TRAINING ---")
+    if HAS_TB:
+        print(f"TensorBoard: run 'tensorboard --logdir {log_dir}' to view")
 
     time.sleep(2)
     time_acc = 0
-    iters = tqdm.trange(0, args.epochs+1,  leave=True)
+    iters = tqdm.trange(0, args.epochs + 1, leave=True)
     os.system('clear') if os.name == 'posix' else os.system('cls')
 
     for i in iters:
         t = time.time()
         result = algo.train()
-        time_acc += time.time()-t
-        iters.set_description(f"{i}) Reward = {result['episode_reward_mean']:.2f} | Level = {args.level} | Avg. Episode Time = {round(time_acc/(i+1), 3)} | TB: {url} | Progress")
-        
+        time_acc += time.time() - t
+
+        if writer is not None:
+            for k, v in result.items():
+                if isinstance(v, (int, float)):
+                    writer.add_scalar(k, v, i)
+
+        iters.set_description(
+            f"{i}) Reward = {result.get('episode_reward_mean', 0):.2f} | "
+            f"Level = {args.level} | "
+            f"Avg. Episode Time = {round(time_acc / (i + 1), 3)} | Progress"
+        )
+
         if i % 50 == 0:
             make_checkpoint(args, algo, log_dir, i, args.level, test_env)
+
+    if writer is not None:
+        writer.close()
