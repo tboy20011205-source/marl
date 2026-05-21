@@ -6,8 +6,12 @@ import numpy as np
 from pathlib import Path
 from gymnasium import Env
 from math import sin, cos, acos, pi, hypot, radians, exp, sqrt
-from warsim.scenplotter.scenario_plotter import PlotConfig, ColorRGBA, StatusMessage, TopLeftMessage, \
-    Airplane, PolyLine, Drawable, Waypoint, Missile, ScenarioPlotter
+try:
+    from warsim.scenplotter.scenario_plotter import PlotConfig, ColorRGBA, StatusMessage, TopLeftMessage, \
+        Airplane, PolyLine, Drawable, Waypoint, Missile, ScenarioPlotter
+    _HAS_PLOTTER = True
+except ImportError:
+    _HAS_PLOTTER = False
 from warsim.simulator.cmano_simulator import Position, CmanoSimulator, UnitDestroyedEvent
 from warsim.simulator.ac1 import Rafale
 from warsim.simulator.ac2 import RafaleLong
@@ -52,10 +56,14 @@ class HHMARLBaseEnv(Env):
         self.hardcoded_opps_escaping = False
         self.opps_escaping_time = 0
 
-        # Plotting
-        self.plt_cfg = PlotConfig()
-        self.plt_cfg.units_scale = 20.0
-        self.plotter = ScenarioPlotter(self.map_limits, dpi=200, config=self.plt_cfg)
+        # Plotting (optional — requires cairo + cartopy)
+        if _HAS_PLOTTER:
+            self.plt_cfg = PlotConfig()
+            self.plt_cfg.units_scale = 20.0
+            self.plotter = ScenarioPlotter(self.map_limits, dpi=200, config=self.plt_cfg)
+        else:
+            self.plt_cfg = None
+            self.plotter = None
 
         super().__init__()
 
@@ -621,8 +629,10 @@ class HHMARLBaseEnv(Env):
 
     def plot(self, out_file: Path, paths=True):
         """
-        Draw current scenario.
+        Draw current scenario.  Skips silently if cairo/cartopy not installed.
         """
+        if not _HAS_PLOTTER:
+            raise RuntimeError("Plotting requires cairo and cartopy. Install with: pip install pycairo cartopy")
         objects = [
             StatusMessage(self.sim.status_text),
             TopLeftMessage(self.sim.utc_time.strftime("%Y %b %d %H:%M:%S"))

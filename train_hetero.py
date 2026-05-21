@@ -89,12 +89,18 @@ def evaluate(args, algo, env, epoch, level, it):
 
         step += 1
         if args.render:
-            env.plot(Path(args.log_path, "current.png"))
+            try:
+                env.plot(Path(args.log_path, "current.png"))
+            except RuntimeError:
+                pass
             time.sleep(0.18)
 
     reward = round(reward, 3)
-    env.plot(Path(args.log_path,
-                  f"Ep_{epoch}_It_{step}_Lv{level}_Rew_{reward}.png"))
+    try:
+        env.plot(Path(args.log_path,
+                      f"Ep_{epoch}_It_{step}_Lv{level}_Rew_{reward}.png"))
+    except RuntimeError:
+        pass
 
 
 def make_checkpoint(args, algo, log_dir, epoch, level, env=None):
