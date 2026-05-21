@@ -6,12 +6,6 @@ import numpy as np
 from pathlib import Path
 from gymnasium import Env
 from math import sin, cos, acos, pi, hypot, radians, exp, sqrt
-try:
-    from warsim.scenplotter.scenario_plotter import PlotConfig, ColorRGBA, StatusMessage, TopLeftMessage, \
-        Airplane, PolyLine, Drawable, Waypoint, Missile, ScenarioPlotter
-    _HAS_PLOTTER = True
-except ImportError:
-    _HAS_PLOTTER = False
 from warsim.simulator.cmano_simulator import Position, CmanoSimulator, UnitDestroyedEvent
 from warsim.simulator.ac1 import Rafale
 from warsim.simulator.ac2 import RafaleLong
@@ -19,14 +13,21 @@ from utils.geodesics import geodetic_direct
 from utils.map_limits import MapLimits
 from utils.angles import sum_angles
 
-colors = {
-    'red_outline': ColorRGBA(0.8, 0.2, 0.2, 1),
-    'red_fill': ColorRGBA(0.8, 0.2, 0.2, 0.2),
-    'blue_outline': ColorRGBA(0.3, 0.6, 0.9, 1),
-    'blue_fill': ColorRGBA(0.3, 0.6, 0.9, 0.2),
-    'waypoint_outline': ColorRGBA(0.8, 0.8, 0.2, 1),
-    'waypoint_fill': ColorRGBA(0.8, 0.8, 0.2, 0.2)
-}
+try:
+    from warsim.scenplotter.scenario_plotter import PlotConfig, ColorRGBA, StatusMessage, TopLeftMessage, \
+        Airplane, PolyLine, Drawable, Waypoint, Missile, ScenarioPlotter
+    _HAS_PLOTTER = True
+    colors = {
+        'red_outline': ColorRGBA(0.8, 0.2, 0.2, 1),
+        'red_fill': ColorRGBA(0.8, 0.2, 0.2, 0.2),
+        'blue_outline': ColorRGBA(0.3, 0.6, 0.9, 1),
+        'blue_fill': ColorRGBA(0.3, 0.6, 0.9, 0.2),
+        'waypoint_outline': ColorRGBA(0.8, 0.8, 0.2, 1),
+        'waypoint_fill': ColorRGBA(0.8, 0.8, 0.2, 0.2)
+    }
+except ImportError:
+    _HAS_PLOTTER = False
+    colors = {}
 
 ACTION_DIM_AC1 = 4
 ACTION_DIM_AC2 = 3
