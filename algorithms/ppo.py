@@ -126,8 +126,12 @@ class PPOPolicy:
     """
 
     def __init__(self, model, action_dims, lr=1e-4, clip_param=0.25,
-                 entropy_coeff=0.01, vf_coeff=0.5, max_grad_norm=0.5):
-        self.model = model
+                 entropy_coeff=0.01, vf_coeff=0.5, max_grad_norm=0.5,
+                 device=None):
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
+        self.model = model.to(device)
         self.action_dims = action_dims  # list of n_categories per action dim
         self.clip_param = clip_param
         self.entropy_coeff = entropy_coeff
@@ -194,11 +198,11 @@ class PPOPolicy:
         return action, new_state, value.item()
 
     def _obs_to_tensor(self, obs):
-        """Convert observation dict (numpy) to tensor dict."""
+        """Convert observation dict (numpy) to tensor dict on the correct device."""
         if isinstance(obs, dict):
-            return {k: torch.from_numpy(v).unsqueeze(0).float() if isinstance(v, np.ndarray) else v
+            return {k: torch.from_numpy(v).unsqueeze(0).float().to(self.device) if isinstance(v, np.ndarray) else v
                     for k, v in obs.items()}
-        return torch.from_numpy(obs).unsqueeze(0).float()
+        return torch.from_numpy(obs).unsqueeze(0).float().to(self.device)
 
     def update(self, buffer, num_epochs=10, mini_batch_size=256):
         """PPO update on collected rollout data. Uses pre-computed GAE from buffer."""
@@ -224,10 +228,10 @@ class PPOPolicy:
             for start in range(0, n, mini_batch_size):
                 batch_idx = indices[start:start + mini_batch_size]
                 batch_obs = self._batch_obs([obs_list[i] for i in batch_idx])
-                batch_acts = torch.stack([act_list[i] for i in batch_idx])
-                batch_old_lp = torch.stack([old_lp_list[i] for i in batch_idx])
-                batch_adv = torch.tensor([adv_list[i] for i in batch_idx], dtype=torch.float32)
-                batch_ret = torch.tensor([ret_list[i] for i in batch_idx], dtype=torch.float32)
+                batch_acts = torch.stack([act_list[i] for i in batch_idx]).to(self.device)
+                batch_old_lp = torch.stack([old_lp_list[i] for i in batch_idx]).to(self.device)
+                batch_adv = torch.tensor([adv_list[i] for i in batch_idx], dtype=torch.float32, device=self.device)
+                batch_ret = torch.tensor([ret_list[i] for i in batch_idx], dtype=torch.float32, device=self.device)
 
                 # Get seq_lens for this batch (if available)
                 seq_lens = None
@@ -268,17 +272,17 @@ class PPOPolicy:
         }
 
     def _batch_obs(self, obs_list):
-        """Stack a list of observation dicts into a batch dict."""
+        """Stack a list of observation dicts into a batch dict on the correct device."""
         if isinstance(obs_list[0], dict):
             batched = {}
             for key in obs_list[0].keys():
                 vals = [o[key] for o in obs_list]
                 if isinstance(vals[0], torch.Tensor):
-                    batched[key] = torch.stack(vals)
+                    batched[key] = torch.stack(vals).to(self.device)
                 else:
-                    batched[key] = torch.tensor(np.stack(vals), dtype=torch.float32)
+                    batched[key] = torch.tensor(np.stack(vals), dtype=torch.float32, device=self.device)
             return batched
-        return torch.stack(obs_list)
+        return torch.stack(obs_list).to(self.device)
 
     def state_dict(self):
         return {
@@ -380,17 +384,19 @@ class MultiAgentPPO:
 
                     aug_obs[agent_id] = aug
 
-                    # Convert to tensor
-                    obs_tensor = {k: torch.from_numpy(v).unsqueeze(0).float() if isinstance(v, np.ndarray) else v
+                    policy = self.policies[policy_id]
+                    dev = policy.device
+
+                    # Convert to tensor on policy's device
+                    obs_tensor = {k: torch.from_numpy(v).unsqueeze(0).float().to(dev) if isinstance(v, np.ndarray) else v
                                   for k, v in aug.items()}
 
-                    policy = self.policies[policy_id]
                     state = recurrent_states.get(policy_id)
                     with torch.no_grad():
                         logits, new_state = policy.model(
                             {"obs": obs_tensor},
-                            state=[s.unsqueeze(0) for s in state] if state and isinstance(state, list) else None,
-                            seq_lens=torch.tensor([1]))
+                            state=[s.unsqueeze(0).to(dev) for s in state] if state and isinstance(state, list) else None,
+                            seq_lens=torch.tensor([1], device=dev))
                         value = policy.model.value_function()
                     a, log_prob, entropy = policy.sample_actions(logits, explore=True)
 
